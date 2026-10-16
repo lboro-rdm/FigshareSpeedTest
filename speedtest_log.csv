@@ -1,0 +1,4 @@
+"timestamp_utc","local_time","local_hour","weekday","tz","tester","article_id","file","file_size_mb","max_mb","run","status","bytes","seconds","ttfb_ms","MB_per_s","Mbit_per_s","note"
+"2026-10-16T08:49:17Z","2026-10-16 09:49:17",9,"Fri","BST","Lara - WFH","34544658","s41746-026-03308-8_reference.pdf",1.458,50,1,"ok",1528624,0.8,630,1.822,15.29,""
+"2026-10-16T08:49:17Z","2026-10-16 09:49:17",9,"Fri","BST","Lara - WFH","34544658","s41746-026-03308-8_reference.pdf",1.458,50,2,"ok",1528624,0.57,460,2.558,21.45,""
+"2026-10-16T08:49:17Z","2026-10-16 09:49:17",9,"Fri","BST","Lara - WFH","34544658","s41746-026-03308-8_reference.pdf",1.458,50,3,"ok",1528624,0.56,410,2.603,21.84,""
