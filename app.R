@@ -1,47 +1,91 @@
-# Figshare download speed monitor - Shiny app
+# Figshare item-creation speed monitor - Shiny app
 #
-# Runs a FIXED test (same article, files, runs and size cap every time),
-# appends every result to a CSV log, and charts speed over time and by
-# time of day. Settings live in R/core.R.
+# Runs a FIXED test (creates a draft titled "Speed Test", times it, then
+# deletes it). Results for the current session are shown in a table laid out
+# exactly like the log CSV, with a button that copies the rows (tab-separated)
+# so they can be pasted straight into Excel.
 #
-#   install.packages(c("shiny", "httr2", "curl"))
+# The History tab reads a shared Excel file on OneDrive/SharePoint
+# (CONFIG$log_url), or the local CSV at CONFIG$log_path if no URL is set. The
+# app only reads it; the team pastes the copied rows into the file themselves.
+#
+#   install.packages(c("shiny", "curl", "jsonlite", "readxl"))
+#   Sys.setenv(APIkey = "your-personal-token")
 #   shiny::runApp("figshare_speedtest_app")
 #
-# Speeds are measured from the machine running the app.
+# Times are measured from the machine running the app. Lower = faster.
 
 library(shiny)
 if (!exists("run_standard_test")) source("R/core.R")   # older Shiny versions
 
+copy_js <- "
+Shiny.addCustomMessageHandler('copy_text', function(text) {
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(fallback);
+  } else { fallback(); }
+});
+"
+
+sheet_url <- "https://lunet-my.sharepoint.com/:x:/r/personal/lbls2_lunet_lboro_ac_uk/Documents/304_RShiny/Lookups/FigshareSpeedTest.xlsx?d=wd2bc3756d9ee429ab038c63eebf1dca7&csf=1&web=1&e=xk6SGF"
+
 ui <- fluidPage(
-  titlePanel("Figshare download speed monitor"),
+  tags$head(tags$script(HTML(copy_js))),
+  titlePanel("Figshare item-creation speed monitor"),
   sidebarLayout(
     sidebarPanel(
       width = 3,
-      textInput("tester", "Your name / location",
-                placeholder = "e.g. Sam - office wifi"),
+      p("The information you include here is not secure. Do not include your real name or detailed location."),
+      textInput("name", "Alias", placeholder = "e.g. Octopus"),
+      textInput("location", "Location", placeholder = "e.g. Library, Not library"),
       actionButton("run", "Run standard test", class = "btn-success"),
+      if (is.null(CONFIG$token)) {
+        tags$div(class = "text-danger", style = "margin-top:8px;",
+                 tags$small("No token found (APIkey) - tests will fail."))
+      },
       hr(),
       h5("Fixed test settings"),
       tags$small(
-        tags$div("Article ID: ", tags$b(CONFIG$article_id)),
-        tags$div("File filter: ", tags$b(if (nzchar(CONFIG$file_match)) CONFIG$file_match else "all files")),
-        tags$div("Runs per file: ", tags$b(CONFIG$runs)),
-        tags$div("Cap per run: ", tags$b(if (is.na(CONFIG$max_mb)) "whole file" else paste(CONFIG$max_mb, "MB"))),
-        tags$div("Log: ", tags$code(CONFIG$log_path))
-      ),
-      hr(),
-      downloadButton("download_log", "Download log (CSV)")
+        tags$div("Draft title: ", tags$b(CONFIG$title)),
+        tags$div("Drafts per test: ", tags$b(CONFIG$runs)),
+        tags$div("Delete after timing: ", tags$b(if (CONFIG$cleanup) "yes" else "no"))
+      )
     ),
     mainPanel(
       width = 9,
       tabsetPanel(
         tabPanel(
-          "Latest test", br(),
+          "Results", br(),
           h4(textOutput("verdict")),
-          tableOutput("latest")
+          tags$style(".copy-bar .form-group { margin-bottom: 0; }"),
+          div(
+            class = "copy-bar",
+            style = "display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:8px;",
+            actionButton("copy", "Copy rows for Excel", icon = icon("copy"), class = "btn-primary"),
+            actionButton("clear", "Clear table", icon = icon("trash")),
+            checkboxInput("header", "Include header row", value = FALSE, width = "auto")
+          ),
+          tags$p(
+            class = "text-muted",
+            style = "margin-bottom:16px;",
+            "Columns match the log file. Paste the copied rows into the ",
+            tags$a("shared results spreadsheet", href = sheet_url,
+                   target = "_blank", rel = "noopener"),
+            " (team access only)."
+          ),
+          tableOutput("results")
         ),
         tabPanel(
           "History", br(),
+          tags$p(class = "text-muted",
+                 if (nzchar(CONFIG$log_url)) "Based on the shared Excel file, not on tests run in this session."
+                 else "Based on the bundled log file, not on tests run in this session."),
+          actionButton("refresh", "Refresh history"),
           selectInput("who", "Show results from", choices = "All"),
           textOutput("health"),
           plotOutput("time_plot", height = "280px"),
@@ -56,17 +100,20 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
-  # Re-reads the log whenever the file changes (including scheduled runs).
-  log_data <- reactivePoll(
-    3000, session,
-    checkFunc = function() {
-      if (file.exists(CONFIG$log_path)) as.numeric(file.mtime(CONFIG$log_path)) else 0
-    },
-    valueFunc = function() read_log(CONFIG$log_path)
-  )
+  # Bundled log, read once per session.
+  log_data <- reactive({
+    input$refresh   # re-read when the Refresh button is clicked
+    withCallingHandlers(
+      read_log(),
+      warning = function(w) {
+        showNotification(conditionMessage(w), type = "warning", duration = 10)
+        invokeRestart("muffleWarning")
+      }
+    )
+  })
   
-  latest  <- reactiveVal(NULL)
-  verdict <- reactiveVal("Click 'Run standard test' to begin.")
+  results <- reactiveVal(NULL)   # every row from tests run in this session
+  verdict <- reactiveVal("Enter your name and location, then click 'Run standard test'.")
   
   observeEvent(input$run, {
     prog <- Progress$new(session, min = 0, max = 1)
@@ -74,34 +121,50 @@ server <- function(input, output, session) {
     on.exit(prog$close(), add = TRUE)
     
     res <- run_standard_test(
-      tester = trimws(input$tester),
+      name = trimws(input$name),
+      location = trimws(input$location),
       progress = function(i, n, detail) prog$set(value = (i - 1) / n, detail = detail)
     )
-    append_log(res)
-    latest(res)
-    verdict(describe_run(res, read_log(CONFIG$log_path)))
+    results(rbind(results(), res))
+    verdict(describe_run(res, isolate(log_data())))
+  })
+  
+  observeEvent(input$clear, {
+    results(NULL)
+    verdict("Table cleared.")
   })
   
   output$verdict <- renderText(verdict())
   
-  output$latest <- renderTable({
-    req(latest())
-    latest()[, c("local_time", "file", "run", "status", "MB_per_s",
-                 "Mbit_per_s", "ttfb_ms", "seconds", "note")]
-  }, digits = 2)
+  # Same columns and order as the log CSV; oldest first so pasting keeps order.
+  output$results <- renderTable({
+    shiny::validate(shiny::need(!is.null(results()), "No tests run in this session yet."))
+    results()[, LOG_COLUMNS]
+  }, digits = 2, na = "")
   
-  # Filter dropdown follows whoever appears in the log
+  observeEvent(input$copy, {
+    req(results())
+    lines <- capture.output(
+      write.table(results()[, LOG_COLUMNS], sep = "\t", quote = FALSE,
+                  row.names = FALSE, col.names = isTRUE(input$header), na = "")
+    )
+    session$sendCustomMessage("copy_text", paste(lines, collapse = "\n"))
+    showNotification(sprintf("Copied %d row(s) - paste into Excel.", nrow(results())),
+                     type = "message", duration = 4)
+  })
+  
+  # ---- History (bundled log) -------------------------------------------------
+  
   observe({
     lg <- log_data()
-    testers <- unique(lg$tester)
-    testers <- sort(testers[nzchar(testers)])
-    updateSelectInput(session, "who", choices = c("All", testers),
+    people <- sort(unique(lg$who[nzchar(lg$who)]))
+    updateSelectInput(session, "who", choices = c("All", people),
                       selected = isolate(input$who))
   })
   
   filtered <- reactive({
     lg <- log_data()
-    if (!is.null(input$who) && input$who != "All") lg <- lg[lg$tester == input$who, ]
+    if (!is.null(input$who) && input$who != "All") lg <- lg[lg$who == input$who, ]
     lg
   })
   
@@ -109,39 +172,40 @@ server <- function(input, output, session) {
   
   output$health <- renderText({
     lg <- filtered()
-    n_tests <- nrow(unique(lg[, c("timestamp_utc", "tester")]))
+    n_tests <- nrow(unique(lg[, c("timestamp_utc", "who")]))
     n_fail  <- sum(lg$status == "error")
-    sprintf("%d test(s) logged, %d failed download(s).", n_tests, n_fail)
+    sprintf("%d test(s) logged, %d failed creation(s).", n_tests, n_fail)
   })
   
   output$time_plot <- renderPlot({
     s <- sessions()
-    validate(need(NROW(s) > 0, "No successful tests logged yet."))
-    testers <- unique(s$tester)
+    shiny::validate(shiny::need(NROW(s) > 0, "No successful tests logged yet."))
+    people <- unique(s$who)
     palette <- c("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2", "#72B7B2")
-    cols <- palette[((seq_along(testers) - 1) %% length(palette)) + 1]
-    plot(s$time, s$MB_per_s, type = "n", xlab = "", ylab = "MB/s",
-         ylim = c(0, max(s$MB_per_s) * 1.1),
-         main = "Download speed over time (dashed = median)")
-    for (j in seq_along(testers)) {
-      d <- s[s$tester == testers[j], ]
-      points(d$time, d$MB_per_s, pch = 19, col = cols[j])
-      if (length(testers) == 1) lines(d$time, d$MB_per_s, col = cols[j])
+    cols <- palette[((seq_along(people) - 1) %% length(palette)) + 1]
+    plot(s$time, s$create_s, type = "n", xlab = "", ylab = "Seconds to create draft",
+         ylim = c(0, max(s$create_s) * 1.1),
+         main = "Item creation time over time (dashed = median; lower is faster)")
+    for (j in seq_along(people)) {
+      d <- s[s$who == people[j], ]
+      points(d$time, d$create_s, pch = 19, col = cols[j])
+      if (length(people) == 1) lines(d$time, d$create_s, col = cols[j])
     }
-    abline(h = median(s$MB_per_s), lty = 2, col = "grey40")
-    if (length(testers) > 1) {
-      legend("topright", legend = ifelse(nzchar(testers), testers, "(no name)"),
+    abline(h = median(s$create_s), lty = 2, col = "grey40")
+    if (length(people) > 1) {
+      legend("topright", legend = ifelse(nzchar(people), people, "(no name)"),
              col = cols, pch = 19, bty = "n")
     }
   })
   
   output$hour_plot <- renderPlot({
     s <- sessions()
-    validate(need(NROW(s) > 0, "No successful tests logged yet."))
-    boxplot(MB_per_s ~ local_hour, data = s, col = "#c6dbef", border = "grey40",
-            xlab = "Hour of day (local time of whoever ran the test)", ylab = "MB/s",
-            main = "Download speed by time of day")
-    stripchart(MB_per_s ~ local_hour, data = s, vertical = TRUE, add = TRUE,
+    shiny::validate(shiny::need(NROW(s) > 0, "No successful tests logged yet."))
+    boxplot(create_s ~ local_hour, data = s, col = "#c6dbef", border = "grey40",
+            xlab = paste0("Hour of day (", CONFIG$timezone, ")"),
+            ylab = "Seconds to create draft",
+            main = "Item creation time by time of day")
+    stripchart(create_s ~ local_hour, data = s, vertical = TRUE, add = TRUE,
                method = "jitter", pch = 19, col = "#4C78A8")
   })
   
@@ -150,19 +214,8 @@ server <- function(input, output, session) {
     req(NROW(s) > 0)
     s <- s[order(s$time, decreasing = TRUE), ]
     s <- head(s, 20)
-    s[, c("local_time", "tester", "file", "n_runs", "MB_per_s", "Mbit_per_s", "ttfb_ms")]
+    s[, c("local_time", "who", "n_runs", "create_s", "ttfb_ms", "delete_s")]
   }, digits = 2)
-  
-  output$download_log <- downloadHandler(
-    filename = function() paste0("figshare_speedtest_log_", Sys.Date(), ".csv"),
-    content = function(file) {
-      if (file.exists(CONFIG$log_path)) {
-        file.copy(CONFIG$log_path, file)
-      } else {
-        writeLines(paste(LOG_COLUMNS, collapse = ","), file)
-      }
-    }
-  )
 }
 
 shinyApp(ui, server)
